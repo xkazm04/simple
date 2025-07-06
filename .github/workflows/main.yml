@@ -1,0 +1,174 @@
+# .github/workflows/auto-merge-copilot.yml
+name: Auto-Merge Copilot PRs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  check_suite:
+    types: [completed]
+  workflow_run:
+    workflows: ["CI/CD Tests"]
+    types: [completed]
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    # Only run for Copilot-created PRs
+    if: github.event.pull_request.user.login == 'copilot[bot]' || github.actor == 'copilot[bot]'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Check PR Labels
+        id: check-labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = context.payload.pull_request?.labels || [];
+            const hasAutoMergeLabel = labels.some(label => label.name === 'auto-merge');
+            const hasDoNotMergeLabel = labels.some(label => label.name === 'do-not-merge');
+            
+            console.log('PR Labels:', labels.map(l => l.name));
+            console.log('Has auto-merge label:', hasAutoMergeLabel);
+            console.log('Has do-not-merge label:', hasDoNotMergeLabel);
+            
+            return {
+              shouldMerge: hasAutoMergeLabel && !hasDoNotMergeLabel,
+              hasAutoMergeLabel,
+              hasDoNotMergeLabel
+            };
+            
+      - name: Wait for checks to complete
+        if: steps.check-labels.outputs.shouldMerge == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha = context.payload.pull_request.head.sha;
+            
+            // Wait for checks to complete (max 10 minutes)
+            let attempts = 0;
+            const maxAttempts = 20;
+            const delay = 30000; // 30 seconds
+            
+            while (attempts < maxAttempts) {
+              const { data: checkRuns } = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: sha
+              });
+              
+              const allComplete = checkRuns.check_runs.every(
+                run => run.status === 'completed'
+              );
+              
+              const allSuccess = checkRuns.check_runs.every(
+                run => run.conclusion === 'success' || run.conclusion === 'neutral'
+              );
+              
+              if (allComplete) {
+                if (allSuccess) {
+                  console.log('All checks passed!');
+                  return true;
+                } else {
+                  console.log('Some checks failed');
+                  return false;
+                }
+              }
+              
+              console.log(`Waiting for checks... (${attempts + 1}/${maxAttempts})`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              attempts++;
+            }
+            
+            throw new Error('Timeout waiting for checks to complete');
+            
+      - name: Auto-merge PR
+        if: steps.check-labels.outputs.shouldMerge == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+            
+            try {
+              // Enable auto-merge
+              await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number,
+                merge_method: 'squash', // or 'merge' or 'rebase'
+                commit_title: `Auto-merge: ${context.payload.pull_request.title}`,
+                commit_message: `Automated merge of Copilot PR #${pull_number}\n\nCo-authored-by: copilot[bot] <copilot[bot]@users.noreply.github.com>`
+              });
+              
+              console.log(`Successfully merged PR #${pull_number}`);
+              
+              // Add a comment
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pull_number,
+                body: '✅ This PR was automatically merged after all checks passed.'
+              });
+              
+            } catch (error) {
+              console.error('Failed to merge PR:', error);
+              
+              // Add a comment about the failure
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pull_number,
+                body: `❌ Auto-merge failed: ${error.message}\n\nPlease review and merge manually.`
+              });
+              
+              throw error;
+            }
+            
+  # Separate job to add labels to Copilot PRs
+  label-copilot-pr:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login == 'copilot[bot]' && github.event.action == 'opened'
+    
+    steps:
+      - name: Add auto-merge label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Only add auto-merge label for certain conditions
+            const title = context.payload.pull_request.title.toLowerCase();
+            const body = context.payload.pull_request.body?.toLowerCase() || '';
+            
+            // Define criteria for auto-merge
+            const isSimpleTask = 
+              title.includes('[copilot]') || 
+              body.includes('copilot task') ||
+              body.includes('automated');
+            
+            if (isSimpleTask) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['auto-merge', 'copilot-generated']
+              });
+              
+              console.log('Added auto-merge label to Copilot PR');
+            } else {
+              // Add review-required label for complex tasks
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['review-required', 'copilot-generated']
+              });
+              
+              console.log('Added review-required label to Copilot PR');
+            }
